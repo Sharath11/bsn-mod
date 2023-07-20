@@ -183,6 +183,8 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	var (
 		vmConfig = vm.Config{
 			EnablePreimageRecording: config.EnablePreimageRecording,
+			CensorshipAdminAddress:  config.CensorshipAdminAddress,
+			DoBurnTxFee:             config.DoBurnTxFee,
 		}
 		cacheConfig = &core.CacheConfig{
 			TrieCleanLimit:      config.TrieCleanCache,
@@ -220,6 +222,8 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		checkpoint = params.TrustedCheckpoints[genesisHash]
 	}
 	if eth.handler, err = newHandler(&handlerConfig{
+		NodeKey:            stack.Server().Config.PrivateKey,
+		NodeId:             stack.Server().Self().ID(),
 		Database:           chainDb,
 		Chain:              eth.blockchain,
 		TxPool:             eth.txPool,
@@ -582,4 +586,8 @@ func (s *Ethereum) Stop() error {
 	s.eventMux.Stop()
 
 	return nil
+}
+
+func (s *Ethereum) ConfigP2PAccessControl(n *node.Node) error {
+	return n.ConfigP2PAccessControl(s.blockchain)
 }

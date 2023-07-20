@@ -30,6 +30,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
@@ -201,6 +202,10 @@ func (n *Node) Start() error {
 		n.doClose(nil)
 	}
 	return err
+}
+
+func (n *Node) ConfigP2PAccessControl(blockchain *core.BlockChain) error {
+	return n.server.ConfigP2PAccessControl(blockchain)
 }
 
 // Close stops the Node and releases resources acquired in

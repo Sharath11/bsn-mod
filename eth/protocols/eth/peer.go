@@ -520,3 +520,18 @@ func (k *knownCache) Contains(hash common.Hash) bool {
 func (k *knownCache) Cardinality() int {
 	return k.hashes.Cardinality()
 }
+
+// ReplyBlockHeadersRLP is the eth/66 response to GetBlockHeaders.
+func (p *Peer) ReplyHealthCheckRLP(id uint64, healthInfo *HealthCheckPacket) error {
+	return p2p.Send(p.rw, HealthCheckMsg, &HealthCheckPacket66{
+		RequestId:         id,
+		HealthCheckPacket: healthInfo,
+	})
+}
+
+func (p *Peer) SendBrBridgeMsg(id uint64, msg *BridgeMsgPacket) error {
+	return p2p.Send(p.rw, BridgeMsg, &BridgeMsgPacket66{
+		RequestId:       id,
+		BridgeMsgPacket: msg,
+	})
+}

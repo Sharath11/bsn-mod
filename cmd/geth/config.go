@@ -163,6 +163,7 @@ func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend) {
 		cfg.Eth.OverrideTerminalTotalDifficulty = new(big.Int).SetUint64(ctx.GlobalUint64(utils.OverrideTerminalTotalDifficulty.Name))
 	}
 	backend, eth := utils.RegisterEthService(stack, &cfg.Eth)
+
 	// Warn users to migrate if they have a legacy freezer format.
 	if eth != nil {
 		firstIdx := uint64(0)
@@ -188,6 +189,7 @@ func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend) {
 	if cfg.Ethstats.URL != "" {
 		utils.RegisterEthStatsService(stack, backend, cfg.Ethstats.URL)
 	}
+
 	return stack, backend
 }
 

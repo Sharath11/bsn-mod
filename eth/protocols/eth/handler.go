@@ -81,6 +81,14 @@ type Backend interface {
 	// PeerInfo retrieves all known `eth` information about a peer.
 	PeerInfo(id enode.ID) interface{}
 
+	PeerInfos() []*enode.Node
+
+	GetSyncMode() string
+
+	// HandlerBridgeMsg is send bridge message to appropriate node,
+	//if this message send to myself , return true
+	HandlerBridgeMsg(msg *BridgeMsgPacket, peer *Peer) bool
+
 	// Handle is a callback to be invoked when a data packet is received from
 	// the remote peer. Only packets not consumed by the protocol handler will
 	// be forwarded to the backend.
@@ -179,6 +187,9 @@ var eth66 = map[uint64]msgHandler{
 	ReceiptsMsg:                   handleReceipts66,
 	GetPooledTransactionsMsg:      handleGetPooledTransactions66,
 	PooledTransactionsMsg:         handlePooledTransactions66,
+	BridgeMsg:                     handleBridgeMsg,
+	GetHealthCheckMsg:             handleGetHealthCheck,
+	HealthCheckMsg:                handleHealthCheck,
 }
 
 // handleMessage is invoked whenever an inbound message is received from a remote

@@ -17,10 +17,17 @@
 package eth
 
 import (
+	"bytes"
+	"crypto/ecdsa"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/p2p/enode"
 	"io"
 	"math/big"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/forkid"
@@ -43,7 +50,7 @@ var ProtocolVersions = []uint{ETH66}
 
 // protocolLengths are the number of implemented message corresponding to
 // different protocol versions.
-var protocolLengths = map[uint]uint64{ETH66: 17}
+var protocolLengths = map[uint]uint64{ETH66: 22}
 
 // maxMessageSize is the maximum cap on the size of a protocol message.
 const maxMessageSize = 10 * 1024 * 1024
@@ -64,6 +71,13 @@ const (
 	NewPooledTransactionHashesMsg = 0x08
 	GetPooledTransactionsMsg      = 0x09
 	PooledTransactionsMsg         = 0x0a
+	BridgeMsg                     = 0x13
+	GetHealthCheckMsg             = 0x14
+	HealthCheckMsg                = 0x15
+)
+
+const (
+	BridgeGetHealthCheckMsg = 0x01
 )
 
 var (
@@ -327,6 +341,179 @@ type PooledTransactionsRLPPacket66 struct {
 	PooledTransactionsRLPPacket
 }
 
+type GetHealthCheckPacket66 struct {
+	RequestId uint64
+}
+
+type HealthCheckPacket66 struct {
+	RequestId uint64
+	*HealthCheckPacket
+}
+
+type HealthCheckPacket struct {
+
+	// 邻节点信息
+	Peers []string
+	// 节点模式 full  light
+	SyncMode string
+	// 当前块高
+	BlockNumber *big.Int
+	BlockHash   string
+	// 节点验证者地址
+	Validator common.Address
+
+	ChainId string
+}
+
+type BridgeMsgType uint8
+
+const (
+	Ask BridgeMsgType = iota
+	Answer
+)
+
+type BridgeMsgPacket66 struct {
+	RequestId uint64
+	*BridgeMsgPacket
+}
+
+type BridgeMsgPacket struct {
+	Id             string
+	Source         enode.ID
+	Target         enode.ID
+	Expiration     uint64
+	Relay          uint
+	BridgeType     BridgeMsgType
+	Msg            *BridgeMsgData
+	RouteSignBytes []byte
+	MsgSignBytes   []byte
+}
+
+func (b *BridgeMsgPacket) Digest() []byte {
+
+	var data []byte
+	data = append(data, []byte(b.Id)...)
+	data = append(data, b.Source.Bytes()...)
+	data = append(data, b.Target.Bytes()...)
+	var buf = make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, b.Expiration)
+	data = append(data, buf...)
+
+	return crypto.Keccak256(data)
+}
+func (b *BridgeMsgPacket) MsgDigest() []byte {
+
+	var data []byte
+	data = append(data, uint8(b.BridgeType))
+	if b.Msg != nil {
+		data = append(data, b.Msg.Bytes()...)
+	}
+	data = append(data, b.RouteSignBytes...)
+	return crypto.Keccak256(data)
+}
+
+func (b *BridgeMsgPacket) RouteValidate() (common.Address, error) {
+	pubkey, err := crypto.SigToPub(b.Digest(), b.RouteSignBytes)
+	if err != nil {
+		return common.Address{}, err
+	}
+	return crypto.PubkeyToAddress(*pubkey), nil
+}
+func (b *BridgeMsgPacket) RouteSign(key *ecdsa.PrivateKey) error {
+	sig, err := crypto.Sign(b.Digest(), key)
+	if err != nil {
+		return err
+	}
+	b.RouteSignBytes = sig
+	return nil
+}
+
+func (b *BridgeMsgPacket) MsgValidate() error {
+	pubkey, err := crypto.SigToPub(b.MsgDigest(), b.MsgSignBytes)
+	if err != nil {
+		return err
+	}
+
+	sigId := enode.PubkeyToIDV4(pubkey)
+
+	if b.BridgeType == Answer && sigId != b.Target {
+		return errors.New("answer validate failed")
+	}
+
+	if b.BridgeType == Ask && sigId != b.Source {
+		return errors.New("ask validate failed")
+	}
+	return nil
+}
+func (b *BridgeMsgPacket) MsgSign(key *ecdsa.PrivateKey) error {
+	sig, err := crypto.Sign(b.MsgDigest(), key)
+	if err != nil {
+		return err
+	}
+	b.MsgSignBytes = sig
+	return nil
+}
+
+func (b *BridgeMsgPacket) Copy() *BridgeMsgPacket {
+
+	n := &BridgeMsgPacket{
+		Id:             b.Id,
+		Source:         b.Source,
+		Target:         b.Target,
+		BridgeType:     b.BridgeType,
+		Expiration:     b.Expiration,
+		Relay:          b.Relay,
+		RouteSignBytes: b.RouteSignBytes,
+		MsgSignBytes:   b.MsgSignBytes,
+	}
+
+	if b.Msg != nil {
+		n.Msg = &BridgeMsgData{
+			Code:    b.Msg.Code,
+			Payload: b.Msg.Payload,
+		}
+	}
+
+	return n
+}
+
+func (b *BridgeMsgPacket) SetMsg(msg *p2p.Msg) {
+	pl := make([]byte, msg.Size)
+	msg.Payload.Read(pl)
+	b.Msg = &BridgeMsgData{
+		Code:    msg.Code,
+		Payload: pl,
+	}
+}
+
+type BridgeMsgData struct {
+	Code    uint64
+	Payload []byte
+}
+
+func (d *BridgeMsgData) Bytes() []byte {
+	var buf = make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, d.Code)
+
+	var data []byte
+	data = append(data, buf...)
+	data = append(data, d.Payload...)
+	return data
+}
+
+func (d *BridgeMsgData) MSG() *p2p.Msg {
+	m := &p2p.Msg{
+		ReceivedAt: time.Now(),
+		Code:       d.Code,
+		Size:       uint32(len(d.Payload)),
+		Payload:    bytes.NewReader(d.Payload),
+	}
+	return m
+}
+
+func (*BridgeMsgPacket) Name() string { return "BridgeMsg" }
+func (*BridgeMsgPacket) Kind() byte   { return BridgeMsg }
+
 func (*StatusPacket) Name() string { return "Status" }
 func (*StatusPacket) Kind() byte   { return StatusMsg }
 
@@ -371,3 +558,6 @@ func (*GetPooledTransactionsPacket) Kind() byte   { return GetPooledTransactions
 
 func (*PooledTransactionsPacket) Name() string { return "PooledTransactions" }
 func (*PooledTransactionsPacket) Kind() byte   { return PooledTransactionsMsg }
+
+func (*HealthCheckPacket) Name() string { return "HealthCheck" }
+func (*HealthCheckPacket) Kind() byte   { return HealthCheckMsg }

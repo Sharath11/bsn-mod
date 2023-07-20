@@ -160,6 +160,8 @@ var (
 		utils.GpoIgnoreGasPriceFlag,
 		utils.MinerNotifyFullFlag,
 		configFileFlag,
+		utils.CensorshipAdminAddressFlag,
+		utils.BurnTxFeeFlag,
 	}
 
 	rpcFlags = []cli.Flag{
@@ -246,6 +248,7 @@ func init() {
 		utils.ShowDeprecated,
 		// See snapshot.go
 		snapshotCommand,
+		validateCommand,
 	}
 	sort.Sort(cli.CommandsByName(app.Commands))
 

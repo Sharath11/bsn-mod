@@ -164,6 +164,8 @@ var AppHelpFlagGroups = []flags.FlagGroup{
 			utils.JSpathFlag,
 			utils.ExecFlag,
 			utils.PreloadJSFlag,
+			utils.CensorshipAdminAddressFlag,
+			utils.BurnTxFeeFlag,
 		},
 	},
 	{

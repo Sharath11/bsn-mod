@@ -64,6 +64,11 @@ web3._extend({
 			params: 2
 		}),
 		new web3._extend.Method({
+			name: 'votingPercentage',
+			call: 'clique_votingpercentage',
+			params: 3
+		}),
+		new web3._extend.Method({
 			name: 'discard',
 			call: 'clique_discard',
 			params: 1

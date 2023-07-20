@@ -438,6 +438,13 @@ func ReadBodyRLP(db ethdb.Reader, hash common.Hash, number uint64) rlp.RawValue 
 	return data
 }
 
+// ReadCensorshipRLP retrieves the block censorship (set and contract address) in RLP encoding.
+func ReadCensorshipRLP(db ethdb.Reader, hash common.Hash, number uint64) rlp.RawValue {
+	var data []byte
+	data, _ = db.Get(blockCensorshipKey(number, hash))
+	return data
+}
+
 // ReadCanonicalBodyRLP retrieves the block body (transactions and uncles) for the canonical
 // block at number, in RLP encoding.
 func ReadCanonicalBodyRLP(db ethdb.Reader, number uint64) rlp.RawValue {
@@ -461,6 +468,12 @@ func ReadCanonicalBodyRLP(db ethdb.Reader, number uint64) rlp.RawValue {
 func WriteBodyRLP(db ethdb.KeyValueWriter, hash common.Hash, number uint64, rlp rlp.RawValue) {
 	if err := db.Put(blockBodyKey(number, hash), rlp); err != nil {
 		log.Crit("Failed to store block body", "err", err)
+	}
+}
+
+func WriteCensorshipRLP(db ethdb.KeyValueWriter, hash common.Hash, number uint64, rlp rlp.RawValue) {
+	if err := db.Put(blockCensorshipKey(number, hash), rlp); err != nil {
+		log.Crit("Failed to store block censorship", "err", err)
 	}
 }
 
@@ -496,6 +509,29 @@ func WriteBody(db ethdb.KeyValueWriter, hash common.Hash, number uint64, body *t
 		log.Crit("Failed to RLP encode body", "err", err)
 	}
 	WriteBodyRLP(db, hash, number, data)
+}
+
+// ReadCensorship retrieves the block censorshipcorresponding to the hash.
+func ReadCensorship(db ethdb.Reader, hash common.Hash, number uint64) *common.Censorship {
+	data := ReadCensorshipRLP(db, hash, number)
+	if len(data) == 0 {
+		return nil
+	}
+	censorship := new(common.Censorship)
+	if err := rlp.Decode(bytes.NewReader(data), censorship); err != nil {
+		log.Error("Invalid block censorship RLP", "hash", hash, "err", err)
+		return nil
+	}
+	return censorship
+}
+
+// WriteCensorship stores a block censorship into the database.
+func WriteCensorship(db ethdb.KeyValueWriter, hash common.Hash, number uint64, censorship *common.Censorship) {
+	data, err := rlp.EncodeToBytes(censorship)
+	if err != nil {
+		log.Crit("Failed to RLP encode censorship", "err", err)
+	}
+	WriteCensorshipRLP(db, hash, number, data)
 }
 
 // DeleteBody removes all block body data associated with a hash.

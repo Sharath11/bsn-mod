@@ -18,7 +18,9 @@ package eth
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/ethereum/go-ethereum/p2p"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
@@ -525,4 +527,93 @@ func handlePooledTransactions66(backend Backend, msg Decoder, peer *Peer) error 
 	requestTracker.Fulfil(peer.id, peer.version, PooledTransactionsMsg, txs.RequestId)
 
 	return backend.Handle(peer, &txs.PooledTransactionsPacket)
+}
+
+func handleGetHealthCheck(backend Backend, msg Decoder, peer *Peer) error {
+	var query GetHealthCheckPacket66
+	if err := msg.Decode(&query); err != nil {
+		return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
+	}
+	res := ServiceGetHealthCheck(backend, peer)
+
+	return peer.ReplyHealthCheckRLP(query.RequestId, res)
+}
+
+func ServiceGetHealthCheck(backend Backend, peer *Peer) *HealthCheckPacket {
+	res := &HealthCheckPacket{}
+	block := backend.Chain().CurrentBlock()
+	res.BlockNumber = block.Number()
+	res.BlockHash = block.Hash().String()
+	res.ChainId = backend.Chain().Config().ChainID.String()
+
+	//res.Validator = backend.Chain().Validator().ValidateAddress()
+	res.SyncMode = backend.GetSyncMode()
+
+	nodes := backend.PeerInfos()
+	for _, node := range nodes {
+		res.Peers = append(res.Peers, node.String())
+	}
+
+	return res
+}
+
+func handleHealthCheck(backend Backend, msg Decoder, peer *Peer) error {
+	// A batch of headers arrived to one of our previous requests
+	res := new(HealthCheckPacket66)
+	if err := msg.Decode(res); err != nil {
+		return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
+	}
+
+	return peer.dispatchResponse(&Response{
+		id:   res.RequestId,
+		code: HealthCheckMsg,
+		Res:  &res.HealthCheckPacket,
+	}, nil)
+}
+
+func handleBridgeMsg(backend Backend, msg Decoder, peer *Peer) error {
+	res := new(BridgeMsgPacket66)
+	if err := msg.Decode(res); err != nil {
+		return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
+	}
+
+	data := res.BridgeMsgPacket
+	self := backend.HandlerBridgeMsg(data, peer)
+	if self {
+		peer.Log().Debug("Bridge message to self , we handle ", "id", data.Id)
+		resMsg := res.Msg
+		if resMsg != nil {
+			askMsg := resMsg.MSG()
+			answerMsg, err := handleBridgeMessage(backend, askMsg, peer)
+			if err != nil {
+				peer.Log().Warn("Bridge handle message has err", "err", err.Error())
+				return nil
+			}
+			data.BridgeType = Answer
+			data.SetMsg(answerMsg)
+			peer.Log().Debug("Answer bridge msg ", "id", data.Id, "code", data.Msg.Code)
+			// send answer message
+			backend.HandlerBridgeMsg(data, peer)
+		} else {
+			peer.Log().Warn("Bridge handle msg is empty , discard")
+		}
+	}
+
+	return nil
+}
+
+func handleBridgeMessage(backend Backend, msg *p2p.Msg, peer *Peer) (*p2p.Msg, error) {
+	peer.Log().Debug("Handle bridge message", "code", msg.Code)
+	switch msg.Code {
+	case BridgeGetHealthCheckMsg:
+		res := ServiceGetHealthCheck(backend, peer)
+		size, r, err := rlp.EncodeToReader(res)
+		if err != nil {
+			return nil, err
+		}
+		resMsg := &p2p.Msg{Code: BridgeGetHealthCheckMsg, Size: uint32(size), Payload: r}
+		return resMsg, nil
+	default:
+		return nil, errors.New("code not found")
+	}
 }

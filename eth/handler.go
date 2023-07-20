@@ -17,7 +17,9 @@
 package eth
 
 import (
+	"crypto/ecdsa"
 	"errors"
+	"github.com/ethereum/go-ethereum/p2p/enode"
 	"math"
 	"math/big"
 	"sync"
@@ -77,6 +79,8 @@ type txPool interface {
 // handlerConfig is the collection of initialization parameters to create a full
 // node network handler.
 type handlerConfig struct {
+	NodeKey    *ecdsa.PrivateKey
+	NodeId     enode.ID
 	Database   ethdb.Database            // Database for direct sync insertions
 	Chain      *core.BlockChain          // Blockchain to serve data from
 	TxPool     txPool                    // Transaction pool to propagate from
@@ -93,6 +97,10 @@ type handlerConfig struct {
 type handler struct {
 	networkID  uint64
 	forkFilter forkid.Filter // Fork ID filter, constant across the lifetime of the node
+
+	noddeKey    *ecdsa.PrivateKey
+	localNodeId enode.ID
+	sync        downloader.SyncMode // Whether to snap or full sync
 
 	snapSync  uint32 // Flag whether snap sync is enabled (gets disabled if we already have blocks)
 	acceptTxs uint32 // Flag whether we're considered synchronised (enables transaction processing)
@@ -124,6 +132,8 @@ type handler struct {
 	chainSync *chainSyncer
 	wg        sync.WaitGroup
 	peerWG    sync.WaitGroup
+
+	bridgeMses *bridgeMsgSet
 }
 
 // newHandler returns a handler for all Ethereum chain management protocol.
@@ -133,6 +143,8 @@ func newHandler(config *handlerConfig) (*handler, error) {
 		config.EventMux = new(event.TypeMux) // Nicety initialization for tests
 	}
 	h := &handler{
+		noddeKey:           config.NodeKey,
+		localNodeId:        config.NodeId,
 		networkID:          config.Network,
 		forkFilter:         forkid.NewFilter(config.Chain),
 		eventMux:           config.EventMux,
@@ -143,6 +155,8 @@ func newHandler(config *handlerConfig) (*handler, error) {
 		merger:             config.Merger,
 		peerRequiredBlocks: config.PeerRequiredBlocks,
 		quitSync:           make(chan struct{}),
+		sync:               config.Sync,
+		bridgeMses:         newBridgeMsgSet(),
 	}
 	if config.Sync == downloader.FullSync {
 		// The database seems empty as the current block is the genesis. Yet the snap

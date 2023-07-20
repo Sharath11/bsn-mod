@@ -822,6 +822,16 @@ var (
 		Usage: "InfluxDB organization name (v2 only)",
 		Value: metrics.DefaultConfig.InfluxDBOrganization,
 	}
+
+	CensorshipAdminAddressFlag = cli.StringFlag{
+		Name:  "censorship.admin.address",
+		Usage: "Admin address for censorship",
+	}
+
+	BurnTxFeeFlag = cli.StringFlag{
+		Name:  "burn.tx.fee",
+		Usage: "Enable burning transaction fee",
+	}
 )
 
 // MakeDataDir retrieves the currently requested data directory, terminating
@@ -1102,6 +1112,16 @@ func setLes(ctx *cli.Context, cfg *ethconfig.Config) {
 	if ctx.GlobalIsSet(LightNoSyncServeFlag.Name) {
 		cfg.LightNoSyncServe = ctx.GlobalBool(LightNoSyncServeFlag.Name)
 	}
+}
+
+func setCensorshipAdminAddress(ctx *cli.Context, cfg *ethconfig.Config) {
+	address := ctx.GlobalString(CensorshipAdminAddressFlag.Name)
+	cfg.CensorshipAdminAddress = common.HexToAddress(address)
+}
+
+func setBurnTxFee(ctx *cli.Context, cfg *ethconfig.Config) {
+	doBurnTxFee := ctx.GlobalString(BurnTxFeeFlag.Name)
+	cfg.DoBurnTxFee = doBurnTxFee == "true"
 }
 
 // MakeDatabaseHandles raises out the number of allowed file handles per process
@@ -1567,6 +1587,8 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	setMiner(ctx, &cfg.Miner)
 	setPeerRequiredBlocks(ctx, cfg)
 	setLes(ctx, cfg)
+	setCensorshipAdminAddress(ctx, cfg)
+	setBurnTxFee(ctx, cfg)
 
 	// Cap the cache allowance and tune the garbage collector
 	mem, err := gopsutil.VirtualMemory()
@@ -1823,6 +1845,8 @@ func RegisterEthService(stack *node.Node, cfg *ethconfig.Config) (ethapi.Backend
 		}
 	}
 	stack.RegisterAPIs(tracers.APIs(backend.APIBackend))
+
+	backend.ConfigP2PAccessControl(stack)
 	return backend.APIBackend, backend
 }
 

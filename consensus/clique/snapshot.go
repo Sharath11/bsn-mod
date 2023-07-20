@@ -19,6 +19,7 @@ package clique
 import (
 	"bytes"
 	"encoding/json"
+	"math/big"
 	"sort"
 	"time"
 
@@ -39,11 +40,29 @@ type Vote struct {
 	Authorize bool           `json:"authorize"` // Whether to authorize or deauthorize the voted account
 }
 
+type LimitVote struct {
+	Signer    common.Address `json:"signer"`    // Authorized signer that cast this vote
+	Block     uint64         `json:"block"`     // Block number the vote was cast in (expire old votes)
+	Limit     uint           `json:"limit"`   
+	Address   common.Address `json:"address"`  // Account being voted on to change its authorization
+	Authorize bool           `json:"authorize"` // Whether to authorize or deauthorize the voted account
+}
+
 // Tally is a simple vote tally to keep the current score of votes. Votes that
 // go against the proposal aren't counted since it's equivalent to not voting.
 type Tally struct {
 	Authorize bool `json:"authorize"` // Whether the vote is about authorizing or kicking someone
 	Votes     int  `json:"votes"`     // Number of votes until now wanting to pass the proposal
+}
+
+type LimitTally struct {
+	Authorize bool `json:"authorize"` // Whether the vote is about authorizing or kicking someone
+	Votes     int  `json:"votes"`     // Number of votes until now wanting to pass the proposal
+	Signer    common.Address `json:"signer"`
+}
+
+type WaitTally struct {
+	Block     uint64  `json:"wait"`     // Number of blocks for the next proposal
 }
 
 // Snapshot is the state of the authorization voting at a given point in time.
@@ -57,6 +76,11 @@ type Snapshot struct {
 	Recents map[uint64]common.Address   `json:"recents"` // Set of recent signers for spam protections
 	Votes   []*Vote                     `json:"votes"`   // List of votes cast in chronological order
 	Tally   map[common.Address]Tally    `json:"tally"`   // Current vote tally to avoid recalculating
+
+	SignerLimit      uint               `json:"limit"`            // Current vote tally to avoid recalculating
+	SignerLimitVotes []*LimitVote       `json:"signerLimitVotes"` // List of votes cast in chronological order
+	SignerLimitTally map[uint]LimitTally `json:"signerLimitTally"`
+	SignerLimitWait  map[uint64]WaitTally `json:"waitTally"`
 }
 
 // signersAscending implements the sort interface to allow sorting a list of addresses
@@ -71,13 +95,16 @@ func (s signersAscending) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 // the genesis block.
 func newSnapshot(config *params.CliqueConfig, sigcache *lru.ARCCache, number uint64, hash common.Hash, signers []common.Address) *Snapshot {
 	snap := &Snapshot{
-		config:   config,
-		sigcache: sigcache,
-		Number:   number,
-		Hash:     hash,
-		Signers:  make(map[common.Address]struct{}),
-		Recents:  make(map[uint64]common.Address),
-		Tally:    make(map[common.Address]Tally),
+		config:           config,
+		sigcache:         sigcache,
+		Number:           number,
+		Hash:             hash,
+		Signers:          make(map[common.Address]struct{}),
+		Recents:          make(map[uint64]common.Address),
+		Tally:            make(map[common.Address]Tally),
+		SignerLimit:      50,
+		SignerLimitTally: make(map[uint]LimitTally),
+		SignerLimitWait:  make(map[uint64]WaitTally),
 	}
 	for _, signer := range signers {
 		snap.Signers[signer] = struct{}{}
@@ -113,14 +140,17 @@ func (s *Snapshot) store(db ethdb.Database) error {
 // copy creates a deep copy of the snapshot, though not the individual votes.
 func (s *Snapshot) copy() *Snapshot {
 	cpy := &Snapshot{
-		config:   s.config,
-		sigcache: s.sigcache,
-		Number:   s.Number,
-		Hash:     s.Hash,
-		Signers:  make(map[common.Address]struct{}),
-		Recents:  make(map[uint64]common.Address),
-		Votes:    make([]*Vote, len(s.Votes)),
-		Tally:    make(map[common.Address]Tally),
+		config:           s.config,
+		sigcache:         s.sigcache,
+		Number:           s.Number,
+		Hash:             s.Hash,
+		Signers:          make(map[common.Address]struct{}),
+		Recents:          make(map[uint64]common.Address),
+		Votes:            make([]*Vote, len(s.Votes)),
+		SignerLimitVotes: make([]*LimitVote, len(s.SignerLimitVotes)),
+		Tally:            make(map[common.Address]Tally),
+		SignerLimitTally: make(map[uint]LimitTally),
+		SignerLimitWait:  make(map[uint64]WaitTally),
 	}
 	for signer := range s.Signers {
 		cpy.Signers[signer] = struct{}{}
@@ -133,6 +163,17 @@ func (s *Snapshot) copy() *Snapshot {
 	}
 	copy(cpy.Votes, s.Votes)
 
+	cpy.SignerLimit = s.SignerLimit
+
+	for address, tally := range s.SignerLimitTally {
+		cpy.SignerLimitTally[address] = tally
+	}
+
+	copy(cpy.SignerLimitVotes, s.SignerLimitVotes)
+
+	for number, tally := range s.SignerLimitWait {
+		cpy.SignerLimitWait[number] = tally
+	}
 	return cpy
 }
 
@@ -143,18 +184,37 @@ func (s *Snapshot) validVote(address common.Address, authorize bool) bool {
 	return (signer && !authorize) || (!signer && authorize)
 }
 
+func (s *Snapshot) validSignerLimitVote(signerLimit uint, authorize bool) bool {
+	return authorize && s.SignerLimit != signerLimit
+}
+
 // cast adds a new vote into the tally.
 func (s *Snapshot) cast(address common.Address, authorize bool) bool {
 	// Ensure the vote is meaningful
 	if !s.validVote(address, authorize) {
 		return false
 	}
+
 	// Cast the vote into an existing or new tally
 	if old, ok := s.Tally[address]; ok {
 		old.Votes++
 		s.Tally[address] = old
 	} else {
 		s.Tally[address] = Tally{Authorize: authorize, Votes: 1}
+	}
+	return true
+}
+
+func (s *Snapshot) castSignerLimit(address common.Address, signerLimit uint) bool {
+	if !s.validSignerLimitVote(signerLimit, true) {
+		return false
+	}
+
+	if old, ok := s.SignerLimitTally[signerLimit]; ok {
+		old.Votes++
+		s.SignerLimitTally[signerLimit] = old
+	} else {
+		s.SignerLimitTally[signerLimit] = LimitTally{Signer: address, Authorize: true, Votes: 1}
 	}
 	return true
 }
@@ -170,6 +230,7 @@ func (s *Snapshot) uncast(address common.Address, authorize bool) bool {
 	if tally.Authorize != authorize {
 		return false
 	}
+
 	// Otherwise revert the vote
 	if tally.Votes > 1 {
 		tally.Votes--
@@ -180,9 +241,67 @@ func (s *Snapshot) uncast(address common.Address, authorize bool) bool {
 	return true
 }
 
+func (s *Snapshot) uncastSignerLimit(signerLimit uint, authorize bool) bool {
+	// If there's no tally, it's a dangling vote, just drop
+	tally, ok := s.SignerLimitTally[signerLimit]
+	if !ok {
+		return false
+	}
+	// Ensure we only revert counted votes
+	if tally.Authorize != authorize {
+		return false
+	}
+
+	// Otherwise revert the vote
+	if tally.Votes > 1 {
+		tally.Votes--
+		s.SignerLimitTally[signerLimit] = tally
+	} else {
+		delete(s.SignerLimitTally, signerLimit)
+	}
+	return true
+}
+
+
+func (s *Snapshot, ) applySignerLimitVotes(signer common.Address, snap *Snapshot, header *types.Header) {
+	number := header.Number.Uint64()
+	limit := uint(new(big.Int).SetBytes(header.Coinbase.Bytes()).Uint64())
+
+	snap.deleteLimitWait()
+
+	if snap.castSignerLimit(signer, limit) {
+		snap.SignerLimitVotes = append(snap.SignerLimitVotes, &LimitVote{
+			Signer:    signer,
+			Block:     number,
+			Address:   header.Coinbase,
+			Limit:     limit,
+			Authorize: true,
+		})
+	}
+
+	// If the vote passed, update the list of signers
+	if tally := snap.SignerLimitTally[limit]; tally.Votes >= int(snap.signerLimit()) {
+		snap.SignerLimit = limit
+		
+		// Discard any previous votes around the just changed account
+		for i := 0; i < len(snap.SignerLimitVotes); i++ {
+			if snap.SignerLimitVotes[i].Address == header.Coinbase {
+				snap.SignerLimitVotes = append(snap.SignerLimitVotes[:i], snap.SignerLimitVotes[i+1:]...)
+				i--
+			}
+		}
+		delete(snap.SignerLimitTally, limit)
+		
+		blockWait := number + uint64(len(s.Signers))
+		snap.SignerLimitWait[uint64(limit)] = WaitTally{Block: blockWait}
+	}
+}
+
 // apply creates a new authorization snapshot by applying the given headers to
 // the original one.
 func (s *Snapshot) apply(headers []*types.Header) (*Snapshot, error) {
+
+	
 	// Allow passing in no headers for cleaner code
 	if len(headers) == 0 {
 		return s, nil
@@ -203,17 +322,22 @@ func (s *Snapshot) apply(headers []*types.Header) (*Snapshot, error) {
 		start  = time.Now()
 		logged = time.Now()
 	)
+
+	
 	for i, header := range headers {
 		// Remove any votes on checkpoint blocks
 		number := header.Number.Uint64()
 		if number%s.config.Epoch == 0 {
 			snap.Votes = nil
 			snap.Tally = make(map[common.Address]Tally)
+
+			snap.SignerLimitVotes = nil
+			snap.SignerLimitTally = make(map[uint]LimitTally)
 		}
+
 		// Delete the oldest signer from the recent list to allow it signing again
-		if limit := uint64(len(snap.Signers)/2 + 1); number >= limit {
-			delete(snap.Recents, number-limit)
-		}
+		snap.shrunkRecents(number)
+
 		// Resolve the authorization key and check against signers
 		signer, err := ecrecover(header, s.sigcache)
 		if err != nil {
@@ -222,12 +346,27 @@ func (s *Snapshot) apply(headers []*types.Header) (*Snapshot, error) {
 		if _, ok := snap.Signers[signer]; !ok {
 			return nil, errUnauthorizedSigner
 		}
+
 		for _, recent := range snap.Recents {
 			if recent == signer {
 				return nil, errRecentlySigned
 			}
 		}
 		snap.Recents[number] = signer
+
+		limit := uint(new(big.Int).SetBytes(header.Coinbase.Bytes()).Uint64())
+
+		//discard previous votes for limit
+		for i, vote := range snap.SignerLimitVotes{
+			if vote.Signer == signer && vote.Address == header.Coinbase && vote.Limit == limit {
+				snap.uncastSignerLimit(limit, true)
+
+				// Uncast the vote from the chronological list
+				snap.SignerLimitVotes = append(snap.SignerLimitVotes[:i], snap.SignerLimitVotes[i+1:]...)
+				break // only one vote allowed
+			}
+		
+		}
 
 		// Header authorized, discard any previous votes from the signer
 		for i, vote := range snap.Votes {
@@ -240,6 +379,7 @@ func (s *Snapshot) apply(headers []*types.Header) (*Snapshot, error) {
 				break // only one vote allowed
 			}
 		}
+
 		// Tally up the new vote from the signer
 		var authorize bool
 		switch {
@@ -247,9 +387,12 @@ func (s *Snapshot) apply(headers []*types.Header) (*Snapshot, error) {
 			authorize = true
 		case bytes.Equal(header.Nonce[:], nonceDropVote):
 			authorize = false
+		case bytes.Equal(header.Nonce[:], nonceSignerLimitAuthVote):
+			s.applySignerLimitVotes(signer, snap, header)
 		default:
 			return nil, errInvalidVote
 		}
+
 		if snap.cast(header.Coinbase, authorize) {
 			snap.Votes = append(snap.Votes, &Vote{
 				Signer:    signer,
@@ -258,17 +401,17 @@ func (s *Snapshot) apply(headers []*types.Header) (*Snapshot, error) {
 				Authorize: authorize,
 			})
 		}
+
 		// If the vote passed, update the list of signers
-		if tally := snap.Tally[header.Coinbase]; tally.Votes > len(snap.Signers)/2 {
+		if tally := snap.Tally[header.Coinbase]; tally.Votes >= int(snap.signerLimit()) {
 			if tally.Authorize {
 				snap.Signers[header.Coinbase] = struct{}{}
 			} else {
 				delete(snap.Signers, header.Coinbase)
 
 				// Signer list shrunk, delete any leftover recent caches
-				if limit := uint64(len(snap.Signers)/2 + 1); number >= limit {
-					delete(snap.Recents, number-limit)
-				}
+				snap.shrunkRecents(number)
+
 				// Discard any previous votes the deauthorized signer cast
 				for i := 0; i < len(snap.Votes); i++ {
 					if snap.Votes[i].Signer == header.Coinbase {
@@ -285,10 +428,12 @@ func (s *Snapshot) apply(headers []*types.Header) (*Snapshot, error) {
 			// Discard any previous votes around the just changed account
 			for i := 0; i < len(snap.Votes); i++ {
 				if snap.Votes[i].Address == header.Coinbase {
+
 					snap.Votes = append(snap.Votes[:i], snap.Votes[i+1:]...)
 					i--
 				}
 			}
+
 			delete(snap.Tally, header.Coinbase)
 		}
 		// If we're taking too much time (ecrecover), notify the user once a while
@@ -323,4 +468,27 @@ func (s *Snapshot) inturn(number uint64, signer common.Address) bool {
 		offset++
 	}
 	return (number % uint64(len(signers))) == uint64(offset)
+}
+
+func (s *Snapshot) signerLimit() uint {
+	return uint(len(s.Signers))*s.SignerLimit/100 + 1
+}
+
+func (s *Snapshot) deleteLimitWait(){
+	for i := range s.SignerLimitWait {
+		delete(s.SignerLimitWait, i)
+	}
+}
+
+func (s *Snapshot) shrunkRecents(number uint64) {
+	if limit := uint64(s.signerLimit()); number >= limit {
+		recentsSize := uint64(len(s.Recents))
+		if recentsSize >= limit {
+			deleteAmount := recentsSize - limit + 1
+			var i uint64
+			for i = 0; i < deleteAmount; i++ {
+				delete(s.Recents, number-limit-i)
+			}
+		}
+	}
 }

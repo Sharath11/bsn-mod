@@ -17,12 +17,16 @@
 package vm
 
 import (
+	"fmt"
 	"math/big"
 	"sync/atomic"
 	"time"
 
+	"encoding/binary"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
@@ -123,6 +127,170 @@ type EVM struct {
 	callGasTemp uint64
 }
 
+func parseBlockedList(data []byte) []common.Address {
+	var addressAmount big.Int
+	addressAmount.SetBytes(data[32:64])
+
+	addresses := make([]common.Address, addressAmount.Uint64())
+
+	for i := uint64(0); i < addressAmount.Uint64(); i++ {
+		addresses[i] = common.BytesToAddress(data[64+i*32 : 64+i*32+32])
+	}
+
+	return addresses
+}
+
+func (evm *EVM) IsInWhitelist(contractAddress common.Address, addr common.Address) bool {
+	simEVM := NewEVM(evm.Context, evm.TxContext, evm.StateDB, evm.chainConfig, evm.Config)
+	var value big.Int
+
+	selector := crypto.Keccak256([]byte("isInWhitelist(address)"))
+	argument := append(make([]byte, 12), addr.Bytes()...)
+	abi := append(selector[0:4], argument...)
+
+	result, _, _ := simEVM.Call(
+		AccountRef(contractAddress),
+		contractAddress,
+		abi,
+		50000000,
+		&value)
+
+	if len(result) == 32 {
+		return result[31] == 1
+	} else {
+		log.Debug(fmt.Sprintf("[bsn] Invalid return value: %+v from contract: %+v with arguments: %+v", result, contractAddress, abi))
+		return true
+	}
+}
+
+func (evm *EVM) IsInBlacklist(contractAddress common.Address, addr common.Address) bool {
+	simEVM := NewEVM(evm.Context, evm.TxContext, evm.StateDB, evm.chainConfig, evm.Config)
+	var value big.Int
+
+	selector := crypto.Keccak256([]byte("isInBlacklist(address)"))
+	argument := append(make([]byte, 12), addr.Bytes()...)
+	abi := append(selector[0:4], argument...)
+
+	result, _, _ := simEVM.Call(
+		AccountRef(contractAddress),
+		contractAddress,
+		abi,
+		50000000,
+		&value)
+
+	if len(result) == 32 {
+		return result[31] == 1
+	} else {
+		log.Debug(fmt.Sprintf("[bsn] Invalid return value: %+v from contract: %+v with arguments: %+v", result, contractAddress, abi))
+		return false
+	}
+}
+
+func encodeNumber(number uint64) []byte {
+	bytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(bytes, number)
+
+	return append(make([]byte, 32-len(bytes)), bytes...)
+}
+
+func decodeNumber(encoding []byte) uint64 {
+	return binary.BigEndian.Uint64(encoding[24:32])
+}
+
+func padRight(stringBytes []byte) []byte {
+	rem := len(stringBytes) % 32
+	padding := make([]byte, 32-rem)
+	return append(stringBytes, padding...)
+}
+
+func encodeString(stringArgument string) []byte {
+	stringBytes := []byte(stringArgument)
+
+	return append(encodeNumber(uint64(len(stringBytes))), padRight(stringBytes)...)
+}
+
+func decodeString(encoding []byte) string {
+	lenBytes := encoding[0:32]
+	stringBytes := encoding[32:]
+	stringLength := decodeNumber(lenBytes)
+	return string(stringBytes[:stringLength])
+}
+
+func decodeStringArray(encoding []byte) []string {
+	amountBytes := encoding[0:32]
+	dataBytes := encoding[32:]
+	elementAmount := decodeNumber(amountBytes)
+	stringArray := make([]string, elementAmount)
+	for i := uint64(0); i < elementAmount; i++ {
+		j := i * 32
+		dataI := decodeNumber(dataBytes[j : j+32])
+		stringArray[i] = decodeString(dataBytes[dataI:])
+	}
+	return stringArray
+}
+
+func (evm *EVM) EnodeIsAuthorized(contractAddress common.Address, enode *enode.Node) bool {
+	simEVM := NewEVM(evm.Context, evm.TxContext, evm.StateDB, evm.chainConfig, evm.Config)
+	var value big.Int
+
+	argEnodeURL := encodeString(enode.String())
+
+	selector := crypto.Keccak256([]byte("isAuthorized(string)"))
+
+	argument := append(encodeNumber(32), argEnodeURL...)
+	abi := append(selector[0:4], argument...)
+
+	result, _, _ := simEVM.Call(
+		AccountRef(contractAddress),
+		contractAddress,
+		abi,
+		50000000,
+		&value)
+
+	if len(result) == 32 {
+		return result[31] == 1
+	} else {
+		log.Debug(fmt.Sprintf("[bsn] Invalid return value: %+v from contract: %+v with arguments: %+v", result, contractAddress, abi))
+		return false
+	}
+}
+
+func (evm *EVM) TrustedNodes(contractAddress common.Address) []*enode.Node {
+	simEVM := NewEVM(evm.Context, evm.TxContext, evm.StateDB, evm.chainConfig, evm.Config)
+	var value big.Int
+
+	selector := crypto.Keccak256([]byte("nodeList()"))
+
+	abi := selector[0:4]
+
+	result, _, _ := simEVM.Call(
+		AccountRef(contractAddress),
+		contractAddress,
+		abi,
+		50000000,
+		&value)
+
+	if len(result) > 0 {
+		enodeURLs := decodeStringArray(result[32:])
+		enodes := make([]*enode.Node, len(enodeURLs))
+		for i, url := range enodeURLs {
+			enode, err := enode.Parse(enode.ValidSchemes, url)
+			if err != nil {
+				log.Debug(fmt.Sprintf("[bsn] Invalid enode url: %+v", url))
+				enodes[i] = nil
+			} else {
+				enodes[i] = enode
+			}
+		}
+		return enodes
+	} else if len(result) == 0 {
+		return nil
+	} else {
+		//log.Debug(fmt.Sprintf("[bsn] Invalid return value: %+v from contract: %+v with arguments: %+v", result, contractAddress, abi))
+		return nil
+	}
+}
+
 // NewEVM returns a new EVM. The returned EVM is not thread safe and should
 // only ever be used *once*.
 func NewEVM(blockCtx BlockContext, txCtx TxContext, statedb StateDB, chainConfig *params.ChainConfig, config Config) *EVM {
@@ -174,6 +342,18 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 	if value.Sign() != 0 && !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value) {
 		return nil, gas, ErrInsufficientBalance
 	}
+
+	if !evm.StateDB.IsCensorshipContract(addr) {
+		if value.Cmp(big.NewInt(0)) != 0 {
+			if (!evm.StateDB.IsInWhitelist(evm, caller.Address())) && (!evm.StateDB.IsInWhitelist(evm, addr)) {
+				return nil, gas, ErrExecutionReverted
+			}
+		}
+		if evm.StateDB.IsInBlacklist(evm, addr) || evm.StateDB.IsInBlacklist(evm, caller.Address()) {
+			return nil, gas, ErrExecutionReverted
+		}
+	}
+
 	snapshot := evm.StateDB.Snapshot()
 	p, isPrecompile := evm.precompile(addr)
 
@@ -232,6 +412,7 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 	// When an error was returned by the EVM or when setting the creation code
 	// above we revert to the snapshot and consume any gas remaining. Additionally
 	// when we're in homestead this also counts for code storage gas errors.
+
 	if err != nil {
 		evm.StateDB.RevertToSnapshot(snapshot)
 		if err != ErrExecutionReverted {

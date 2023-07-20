@@ -49,10 +49,24 @@ func (h *ethHandler) PeerInfo(id enode.ID) interface{} {
 	return nil
 }
 
+// PeerInfo retrieves all known `eth` information about a peer.
+func (h *ethHandler) PeerInfos() []*enode.Node {
+	return h.peers.peerInfos()
+
+}
+
+func (h *ethHandler) GetSyncMode() string {
+	return h.sync.String()
+}
+
 // AcceptTxs retrieves whether transaction processing is enabled on the node
 // or if inbound transactions should simply be dropped.
 func (h *ethHandler) AcceptTxs() bool {
 	return atomic.LoadUint32(&h.acceptTxs) == 1
+}
+
+func (h *ethHandler) HandlerBridgeMsg(msg *eth.BridgeMsgPacket, peer *eth.Peer) bool {
+	return (*handler)(h).SendBridgeMsg(msg, peer)
 }
 
 // Handle is invoked from a peer's message handler when it receives a new remote

@@ -181,6 +181,20 @@ It's deprecated, please use "geth db export" instead.
 This command dumps out the state for a given block (or latest, if none provided).
 `,
 	}
+
+	validateCommand = cli.Command{
+		Action:    utils.MigrateFlags(validate),
+		Name:      "validate",
+		Usage:     "Sign the node's ID with the node's private key",
+		ArgsUsage: "<datadir> ",
+		Flags: []cli.Flag{
+			utils.DataDirFlag,
+		},
+		Category: "CONSOLE COMMANDS",
+		Description: `
+This command will output the node signature verification information when Spartan node joins the network.
+`,
+	}
 )
 
 // initGenesis will initialise the given JSON format genesis file and writes it as
@@ -442,6 +456,28 @@ func parseDumpConfig(ctx *cli.Context, stack *node.Node) (*state.DumpConfig, eth
 		"skipcode", conf.SkipCode, "skipstorage", conf.SkipStorage,
 		"start", hexutil.Encode(conf.Start), "limit", conf.Max)
 	return conf, db, header.Root, nil
+}
+
+func validate(ctx *cli.Context) error {
+	conf := defaultNodeConfig()
+	conf.DataDir = ctx.GlobalString(utils.DataDirFlag.Name)
+
+	keyfile := conf.ResolvePath("nodekey")
+	key, err := crypto.LoadECDSA(keyfile)
+	if err != nil {
+		fmt.Println("Read node private key has error, Please check file <" + conf.DataDir + ">")
+		return err
+	}
+
+	v, err := NewValidateInfo(key, ctx.GlobalString(utils.HTTPListenAddrFlag.Name), ctx.GlobalInt(utils.ListenPortFlag.Name))
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(v.ToJson())
+
+	return nil
+
 }
 
 func dump(ctx *cli.Context) error {

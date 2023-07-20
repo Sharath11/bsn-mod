@@ -107,6 +107,17 @@ func (b *testBackend) Handle(*Peer, Packet) error {
 	panic("data processing tests should be done in the handler package")
 }
 
+func (b *testBackend) PeerInfos() []*enode.Node {
+	panic("data processing tests should be done in the handler package")
+}
+
+func (b *testBackend) GetSyncMode() string {
+	panic("data processing tests should be done in the handler package")
+}
+func (b *testBackend) HandlerBridgeMsg(msg *BridgeMsgPacket, peer *Peer) bool {
+	panic("data processing tests should be done in the handler package")
+}
+
 // Tests that block headers can be retrieved from a remote chain based on user queries.
 func TestGetBlockHeaders66(t *testing.T) { testGetBlockHeaders(t, ETH66) }
 

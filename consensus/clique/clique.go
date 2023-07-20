@@ -63,6 +63,8 @@ var (
 	nonceAuthVote = hexutil.MustDecode("0xffffffffffffffff") // Magic nonce number to vote on adding a new signer
 	nonceDropVote = hexutil.MustDecode("0x0000000000000000") // Magic nonce number to vote on removing a signer.
 
+	nonceSignerLimitAuthVote = hexutil.MustDecode("0xfffffff100000000") // Magic nonce number to vote on adding a new signer
+
 	uncleHash = types.CalcUncleHash(nil) // Always Keccak256(RLP([])) as uncles are meaningless outside of PoW.
 
 	diffInTurn = big.NewInt(2) // Block difficulty for in-turn signatures
@@ -176,7 +178,8 @@ type Clique struct {
 	recents    *lru.ARCCache // Snapshots for recent block to speed up reorgs
 	signatures *lru.ARCCache // Signatures of recent blocks to speed up mining
 
-	proposals map[common.Address]bool // Current list of proposals we are pushing
+	proposals            map[common.Address]bool // Current list of proposals we are pushing
+	signerLimitProposals map[uint]bool           // Current list of signer limit percentage we are pushing
 
 	signer common.Address // Ethereum address of the signing key
 	signFn SignerFn       // Signer function to authorize hashes with
@@ -199,11 +202,12 @@ func New(config *params.CliqueConfig, db ethdb.Database) *Clique {
 	signatures, _ := lru.NewARC(inmemorySignatures)
 
 	return &Clique{
-		config:     &conf,
-		db:         db,
-		recents:    recents,
-		signatures: signatures,
-		proposals:  make(map[common.Address]bool),
+		config:               &conf,
+		db:                   db,
+		recents:              recents,
+		signatures:           signatures,
+		proposals:            make(map[common.Address]bool),
+		signerLimitProposals: make(map[uint]bool),
 	}
 }
 
@@ -259,7 +263,7 @@ func (c *Clique) verifyHeader(chain consensus.ChainHeaderReader, header *types.H
 		return errInvalidCheckpointBeneficiary
 	}
 	// Nonces must be 0x00..0 or 0xff..f, zeroes enforced on checkpoints
-	if !bytes.Equal(header.Nonce[:], nonceAuthVote) && !bytes.Equal(header.Nonce[:], nonceDropVote) {
+	if !bytes.Equal(header.Nonce[:], nonceAuthVote) && !bytes.Equal(header.Nonce[:], nonceDropVote) && !bytes.Equal(header.Nonce[:], nonceSignerLimitAuthVote) {
 		return errInvalidVote
 	}
 	if checkpoint && !bytes.Equal(header.Nonce[:], nonceDropVote) {
@@ -383,6 +387,9 @@ func (c *Clique) snapshot(chain consensus.ChainHeaderReader, number uint64, hash
 			if s, err := loadSnapshot(c.config, c.signatures, c.db, hash); err == nil {
 				log.Trace("Loaded voting snapshot from disk", "number", number, "hash", hash)
 				snap = s
+				if number == 0 || snap.SignerLimit == 0 {
+					snap.SignerLimit = 50
+				}
 				break
 			}
 		}
@@ -476,7 +483,7 @@ func (c *Clique) verifySeal(snap *Snapshot, header *types.Header, parents []*typ
 	for seen, recent := range snap.Recents {
 		if recent == signer {
 			// Signer is among recents, only fail if the current block doesn't shift it out
-			if limit := uint64(len(snap.Signers)/2 + 1); seen > number-limit {
+			if limit := uint64(snap.signerLimit()); seen > number-limit {
 				return errRecentlySigned
 			}
 		}
@@ -504,6 +511,7 @@ func (c *Clique) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 	number := header.Number.Uint64()
 	// Assemble the voting snapshot to check which votes make sense
 	snap, err := c.snapshot(chain, number-1, header.ParentHash, nil)
+
 	if err != nil {
 		return err
 	}
@@ -517,6 +525,18 @@ func (c *Clique) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 				addresses = append(addresses, address)
 			}
 		}
+
+		limits := make([]uint, 0, len(c.signerLimitProposals))
+		for limit, authorize := range c.signerLimitProposals {
+			if snap.SignerLimitWait[uint64(limit)].Block >= number {
+				delete(c.signerLimitProposals, limit)
+			}
+
+			if snap.validSignerLimitVote(limit, authorize) {
+				limits = append(limits, limit)
+			}
+		}
+
 		// If there's pending proposals, cast a vote on them
 		if len(addresses) > 0 {
 			header.Coinbase = addresses[rand.Intn(len(addresses))]
@@ -525,6 +545,10 @@ func (c *Clique) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 			} else {
 				copy(header.Nonce[:], nonceDropVote)
 			}
+		} else if len(limits) > 0 {
+			limit := limits[rand.Intn(len(limits))]
+			header.Coinbase = common.BigToAddress(new(big.Int).SetUint64(uint64(limit)))
+			copy(header.Nonce[:], nonceSignerLimitAuthVote)
 		}
 		c.lock.RUnlock()
 	}
@@ -618,7 +642,7 @@ func (c *Clique) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 	for seen, recent := range snap.Recents {
 		if recent == signer {
 			// Signer is among recents, only wait if the current block doesn't shift it out
-			if limit := uint64(len(snap.Signers)/2 + 1); number < limit || seen > number-limit {
+			if limit := uint64(snap.signerLimit()); number < limit || seen > number-limit {
 				return errors.New("signed recently, must wait for others")
 			}
 		}
@@ -627,7 +651,7 @@ func (c *Clique) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 	delay := time.Unix(int64(header.Time), 0).Sub(time.Now()) // nolint: gosimple
 	if header.Difficulty.Cmp(diffNoTurn) == 0 {
 		// It's not our turn explicitly to sign, delay it a bit
-		wiggle := time.Duration(len(snap.Signers)/2+1) * wiggleTime
+		wiggle := time.Duration(snap.signerLimit()) * wiggleTime
 		delay += time.Duration(rand.Int63n(int64(wiggle)))
 
 		log.Trace("Out-of-turn signing requested", "wiggle", common.PrettyDuration(wiggle))

@@ -17,10 +17,12 @@
 package types
 
 import (
+	"bytes"
 	"io"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
@@ -137,4 +139,33 @@ func (l *LogForStorage) DecodeRLP(s *rlp.Stream) error {
 		}
 	}
 	return err
+}
+
+var CensorshipContractNodeAddedEventTopicHash = crypto.Keccak256Hash([]byte("NodeAdded(address,string)"))
+var CensorshipContractNodeRemovedEventTopicHash = crypto.Keccak256Hash([]byte("NodeRemoved(address,string)"))
+var UpdateCensorshipContractEventTopicHash = crypto.Keccak256Hash([]byte("UpdateCensorshipContract(address,address)"))
+
+func (eventLog *Log) IsNodeRemovedEvent() bool {
+	if len(eventLog.Topics) > 0 {
+		eventTopic := eventLog.Topics[0]
+		return bytes.Equal(eventTopic.Bytes(), CensorshipContractNodeRemovedEventTopicHash.Bytes())
+	} else {
+		return false
+	}
+}
+
+func (log *Log) IsNodeAddedEvent() bool {
+	if len(log.Topics) > 0 {
+		return bytes.Equal(log.Topics[0].Bytes(), CensorshipContractNodeAddedEventTopicHash.Bytes())
+	} else {
+		return false
+	}
+}
+
+func (log *Log) IsUpdateCensorshipContractEvent() bool {
+	if len(log.Topics) > 0 {
+		return bytes.Equal(log.Topics[0].Bytes(), UpdateCensorshipContractEventTopicHash.Bytes())
+	} else {
+		return false
+	}
 }

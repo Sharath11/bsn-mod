@@ -166,6 +166,11 @@ type Tree struct {
 
 	// Test hooks
 	onFlatten func() // Hook invoked when the bottom most diff layers are flattened
+
+    ContractAddress common.Address
+    WhiteListMap map[common.Address]bool
+    BlackListMap map[common.Address]bool
+    ContractAddressSet bool
 }
 
 // New attempts to load an already existing snapshot from a persistent key-value

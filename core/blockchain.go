@@ -18,6 +18,8 @@
 package core
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -36,6 +38,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/internal/syncx"
@@ -209,6 +212,9 @@ type BlockChain struct {
 	processor  Processor // Block transaction processor interface
 	forker     *ForkChoice
 	vmConfig   vm.Config
+
+	delEnode func(string)
+	addEnode func(string)
 }
 
 // NewBlockChain returns a fully initialised block chain using information
@@ -310,6 +316,8 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 		}
 	}
 
+	bc.setCensorshipContractAddress()
+
 	// Ensure that a previous crash in SetHead doesn't leave extra ancients
 	if frozen, err := bc.db.Ancients(); err == nil && frozen > 0 {
 		var (
@@ -406,6 +414,81 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 	return bc, nil
 }
 
+func (bc *BlockChain) ConfigP2PAccessControl(addEnode func(string), delEnode func(string)) error {
+	bc.delEnode = delEnode
+	bc.addEnode = addEnode
+	return nil
+}
+
+var CensorshipContractNodeAddedEventTopicHash = crypto.Keccak256Hash([]byte("NodeAdded(address,string)"))
+var CensorshipContractNodeRemovedEventTopicHash = crypto.Keccak256Hash([]byte("NodeRemoved(address,string)"))
+var UpdateCensorshipContractEventTopicHash = crypto.Keccak256Hash([]byte("UpdateCensorshipContract(address,address)"))
+
+func isNodeRemovedEvent(eventLog *types.Log) bool {
+	if len(eventLog.Topics) > 0 {
+		eventTopic := eventLog.Topics[0]
+		return bytes.Equal(eventTopic.Bytes(), CensorshipContractNodeRemovedEventTopicHash.Bytes())
+	} else {
+		return false
+	}
+}
+
+func isNodeAddedEvent(log *types.Log) bool {
+	if len(log.Topics) > 0 {
+		return bytes.Equal(log.Topics[0].Bytes(), CensorshipContractNodeAddedEventTopicHash.Bytes())
+	} else {
+		return false
+	}
+}
+
+func isUpdateCensorshipContractEvent(log *types.Log) bool {
+	if len(log.Topics) > 0 {
+		return bytes.Equal(log.Topics[0].Bytes(), UpdateCensorshipContractEventTopicHash.Bytes())
+	} else {
+		return false
+	}
+}
+
+func parseABIString(str []byte) string {
+	length := binary.BigEndian.Uint64(str[56:64])
+	return string(str[64 : 64+length])
+}
+
+func parseABIAddress(data []byte) common.Address {
+	return common.BytesToAddress(data[12 : 12+common.AddressLength])
+}
+
+func (bc *BlockChain) CensorshipContractManagement(logs []*types.Log, stateDB *state.StateDB) error {
+	if state.CensorshipContractAddressSet {
+		for _, eventLog := range logs {
+			if state.IsCensorshipContract(eventLog.Address) {
+				if isUpdateCensorshipContractEvent(eventLog) {
+					address := parseABIAddress(eventLog.Data)
+					stateDB.SetCensorshipContract(address)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (bc *BlockChain) P2PAccessControl(logs []*types.Log) error {
+	if state.CensorshipContractAddressSet {
+		for _, eventLog := range logs {
+			if state.IsCensorshipContract(eventLog.Address) {
+				if isNodeRemovedEvent(eventLog) {
+					enode := parseABIString(eventLog.Data)
+					bc.delEnode(enode)
+				} else if isNodeAddedEvent(eventLog) {
+					enode := parseABIString(eventLog.Data)
+					bc.addEnode(enode)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // empty returns an indicator whether the blockchain is empty.
 // Note, it's a special case that we connect a non-empty ancient
 // database with an empty node, so that we can plugin the ancient
@@ -418,6 +501,47 @@ func (bc *BlockChain) empty() bool {
 		}
 	}
 	return true
+}
+
+func (bc *BlockChain) NewEVM(blockCtx vm.BlockContext, txCtx vm.TxContext) *vm.EVM {
+	block := bc.CurrentBlock()
+	statedb, err := state.New(block.Root(), bc.stateCache, bc.snaps)
+	if err != nil {
+		log.Debug("Creating new EVM from blockchain has error", err)
+		return nil
+	} else {
+		return vm.NewEVM(blockCtx, txCtx, statedb, bc.chainConfig, bc.vmConfig)
+	}
+}
+
+func (bc *BlockChain) setCensorshipContractAddress() {
+	block := bc.CurrentBlock()
+	censorship := bc.GetCensorship(block.Hash())
+	stateDB, err := bc.State()
+	if err != nil {
+		log.Warn("Set censorship contract address new state DB has err", "err", err.Error())
+		return
+	}
+
+	if censorship != nil {
+		stateDB.SetCensorship(censorship)
+		return
+	} else {
+		adminAddr := bc.vmConfig.CensorshipAdminAddress
+		adminNonce := stateDB.GetNonce(adminAddr)
+		log.Info("Censorship contract address set", "admin address", adminAddr, "nonce", adminNonce)
+		for nonce := uint64(0); nonce <= adminNonce; nonce++ {
+			censorshipContractAddr := crypto.CreateAddress(adminAddr, nonce)
+			code := stateDB.GetCode(censorshipContractAddr)
+			if len(code) > 0 {
+				log.Info("Censorship contract address set", "contract address", censorshipContractAddr, "nonce", adminNonce)
+				stateDB.SetCensorshipContract(censorshipContractAddr)
+				return
+			}
+		}
+		log.Info("Censorship contract not deploy")
+		return
+	}
 }
 
 // loadLastState loads the last known chain state from the database. This method
@@ -1183,6 +1307,15 @@ func (bc *BlockChain) writeKnownBlock(block *types.Block) error {
 	return nil
 }
 
+func (bc *BlockChain) SaveCensorship(state *state.StateDB) {
+	if state.Censorship.Set {
+		bc.snaps.ContractAddressSet = state.Censorship.Set
+		bc.snaps.ContractAddress = state.Censorship.ContractAddress
+		// bc.snaps.BlackListMap = state.Censorship.BlackListMap
+		// bc.snaps.WhiteListMap = state.Censorship.WhiteListMap
+	}
+}
+
 // writeBlockWithState writes block, metadata and corresponding state data to the
 // database.
 func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.Receipt, logs []*types.Log, state *state.StateDB) error {
@@ -1203,6 +1336,7 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	rawdb.WriteBlock(blockBatch, block)
 	rawdb.WriteReceipts(blockBatch, block.Hash(), block.NumberU64(), receipts)
 	rawdb.WritePreimages(blockBatch, state.Preimages())
+	rawdb.WriteCensorship(blockBatch, block.Hash(), block.NumberU64(), state.GetCensorship())
 	if err := blockBatch.Write(); err != nil {
 		log.Crit("Failed to write block into disk", "err", err)
 	}
@@ -1212,6 +1346,8 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 		return err
 	}
 	triedb := bc.stateCache.TrieDB()
+
+	bc.SaveCensorship(state)
 
 	// If we're running an archive node, always flush
 	if bc.cacheConfig.TrieDirtyDisabled {
@@ -1280,6 +1416,8 @@ func (bc *BlockChain) WriteBlockAndSetHead(block *types.Block, receipts []*types
 // and also it applies the given block as the new chain head. This function expects
 // the chain mutex to be held.
 func (bc *BlockChain) writeBlockAndSetHead(block *types.Block, receipts []*types.Receipt, logs []*types.Log, state *state.StateDB, emitHeadEvent bool) (status WriteStatus, err error) {
+	bc.CensorshipContractManagement(logs, state)
+
 	if err := bc.writeBlockWithState(block, receipts, logs, state); err != nil {
 		return NonStatTy, err
 	}
@@ -1321,6 +1459,7 @@ func (bc *BlockChain) writeBlockAndSetHead(block *types.Block, receipts []*types
 	} else {
 		bc.chainSideFeed.Send(ChainSideEvent{Block: block})
 	}
+	bc.P2PAccessControl(logs)
 	return status, nil
 }
 
@@ -1605,6 +1744,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals, setHead bool)
 		// Process block using the parent state as reference point
 		substart := time.Now()
 		receipts, logs, usedGas, err := bc.processor.Process(block, statedb, bc.vmConfig)
+
 		if err != nil {
 			bc.reportBlock(block, receipts, err)
 			atomic.StoreUint32(&followupInterrupt, 1)

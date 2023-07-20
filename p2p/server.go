@@ -31,6 +31,9 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/mclock"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
@@ -197,6 +200,9 @@ type Server struct {
 
 	// State of run loop and listenLoop.
 	inboundHistory expHeap
+
+	blockchain               *core.BlockChain
+	enodeIDAuthorisedCounter map[enode.ID]int
 }
 
 type peerOpFunc func(map[enode.ID]*Peer)
@@ -291,6 +297,52 @@ func (c *conn) set(f connFlag, val bool) {
 	}
 }
 
+func (srv *Server) ConfigP2PAccessControl(blockchain *core.BlockChain) error {
+	srv.blockchain = blockchain
+	srv.enodeIDAuthorisedCounter = make(map[enode.ID]int)
+	block := blockchain.CurrentBlock()
+	header := block.Header()
+	blockContext := core.NewEVMBlockContext(header, blockchain, nil)
+	vm := blockchain.NewEVM(blockContext, vm.TxContext{})
+	blockchain.ConfigP2PAccessControl(
+		func(enodeURL string) {
+			enode, err := enode.Parse(enode.ValidSchemes, enodeURL)
+
+			if err != nil {
+				log.Debug(fmt.Sprintf("[bsn] error adding peer[%+v]: %+v", enode, err))
+			} else if vm.EnodeIsAuthorized(state.CensorshipContractAddress, enode){
+				// id := enode.ID()
+				// srv.enodeIDAuthorisedCounter[id]++
+				srv.AddPeer(enode)
+			}
+		},
+		func(enodeURL string) {
+			enode, err := enode.Parse(enode.ValidSchemes, enodeURL)
+			if err != nil {
+				log.Debug(fmt.Sprintf("[bsn] error removing peer[%+v]: %+v", enode, err))
+			} else {
+				// id := enode.ID()
+				// counter, exist := srv.enodeIDAuthorisedCounter[id]
+				// if exist {
+				// 	if counter == 1 {
+				// 		delete(srv.enodeIDAuthorisedCounter, id)
+				// 	} else {
+				// 		srv.enodeIDAuthorisedCounter[id] = counter - 1
+				// 	}
+				// } else {
+				// 	log.Debug(fmt.Sprintf("[bsn] error adding enode ID authorised counter, ID: %+v", id))
+				// }
+				for _, peer := range srv.Peers() {
+					peerNode := peer.Node()
+					if peerNode.ID() == enode.ID() {
+						srv.RemovePeer(peerNode)
+					}
+				}
+			}
+		})
+	return nil
+}
+
 // LocalNode returns the local node record.
 func (srv *Server) LocalNode() *enode.LocalNode {
 	return srv.localnode
@@ -320,7 +372,14 @@ func (srv *Server) PeerCount() int {
 // the server will connect to the node. If the connection fails for any reason, the server
 // will attempt to reconnect the peer.
 func (srv *Server) AddPeer(node *enode.Node) {
-	srv.dialsched.addStatic(node)
+	blockchain := srv.blockchain
+	block := blockchain.CurrentBlock()
+	header := block.Header()
+	blockContext := core.NewEVMBlockContext(header, blockchain, nil)
+	vm := blockchain.NewEVM(blockContext, vm.TxContext{})
+	if vm.EnodeIsAuthorized(state.CensorshipContractAddress, node){
+		srv.dialsched.addStatic(node)
+	}
 }
 
 // RemovePeer removes a node from the static node set. It also disconnects from the given
@@ -614,6 +673,7 @@ func (srv *Server) setupDiscovery() error {
 	return nil
 }
 
+
 func (srv *Server) setupDialScheduler() {
 	config := dialConfig{
 		self:           srv.localnode.ID(),
@@ -633,6 +693,28 @@ func (srv *Server) setupDialScheduler() {
 	srv.dialsched = newDialScheduler(config, srv.discmix, srv.SetupConn)
 	for _, n := range srv.StaticNodes {
 		srv.dialsched.addStatic(n)
+	}
+
+	blockchain := srv.blockchain
+	block := blockchain.CurrentBlock()
+	header := block.Header()
+	blockContext := core.NewEVMBlockContext(header, blockchain, nil)
+	evm := blockchain.NewEVM(blockContext, vm.TxContext{})
+	enodes := evm.TrustedNodes(state.CensorshipContractAddress)
+
+
+	if state.CensorshipContractAddressSet && len(enodes) > 0 {
+		blockchain := srv.blockchain
+		block := blockchain.CurrentBlock()
+		header := block.Header()
+		blockContext := core.NewEVMBlockContext(header, blockchain, nil)
+		evm := blockchain.NewEVM(blockContext, vm.TxContext{})
+		enodes := evm.TrustedNodes(state.CensorshipContractAddress)
+		for _, n := range enodes {
+			if n != nil {
+				srv.dialsched.addStatic(n)
+			}
+		}
 	}
 }
 
@@ -687,6 +769,41 @@ func (srv *Server) doPeerOp(fn peerOpFunc) {
 	case srv.peerOp <- fn:
 		<-srv.peerOpDone
 	case <-srv.quit:
+	}
+}
+
+func (srv *Server) BSNP2PAccessControlFilter(enode *enode.Node) error {
+	blockchain := srv.blockchain
+	block := blockchain.CurrentBlock()
+	header := block.Header()
+	blockContext := core.NewEVMBlockContext(header, blockchain, nil)
+	evm := blockchain.NewEVM(blockContext, vm.TxContext{})
+	enodes := evm.TrustedNodes(state.CensorshipContractAddress)
+
+	if state.CensorshipContractAddressSet && len(enodes) > 0  {
+		// id := enode.ID()
+		// _, exist := srv.enodeIDAuthorisedCounter[id]
+		// log.Debug(fmt.Sprintf("[bsn][p2p-ac] ac filter, id: %+v, enode ids: %+v", id, srv.enodeIDAuthorisedCounter))
+		// if !exist {
+		// 	log.Info(fmt.Sprintf("[bsn][p2p-ac] %+v is blocked", enode))
+		// 	return DiscInvalidIdentity
+		// } else {
+		// 	return nil
+		// }
+		blockchain := srv.blockchain
+		block := blockchain.CurrentBlock()
+		header := block.Header()
+		blockContext := core.NewEVMBlockContext(header, blockchain, nil)
+		vm := blockchain.NewEVM(blockContext, vm.TxContext{})
+
+		if vm.EnodeIsAuthorized(state.CensorshipContractAddress, enode) {
+			return nil
+		} else {
+			log.Info(fmt.Sprintf("%s is blocked", enode))
+			return DiscInvalidIdentity
+		}
+	} else {
+		return nil
 	}
 }
 
@@ -816,6 +933,10 @@ func (srv *Server) postHandshakeChecks(peers map[enode.ID]*Peer, inboundCount in
 }
 
 func (srv *Server) addPeerChecks(peers map[enode.ID]*Peer, inboundCount int, c *conn) error {
+	if p2pAccessControlError := srv.BSNP2PAccessControlFilter(c.node); p2pAccessControlError != nil {
+		return p2pAccessControlError
+	}
+
 	// Drop connections with no matching protocols.
 	if len(srv.Protocols) > 0 && countMatchingProtocols(srv.Protocols, c.caps) == 0 {
 		return DiscUselessPeer

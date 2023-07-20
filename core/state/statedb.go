@@ -18,6 +18,8 @@
 package state
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/big"
@@ -28,6 +30,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
@@ -122,6 +125,8 @@ type StateDB struct {
 	StorageUpdated int
 	AccountDeleted int
 	StorageDeleted int
+
+	Censorship common.Censorship
 }
 
 // New creates a new state from a given trie.
@@ -144,6 +149,14 @@ func New(root common.Hash, db Database, snaps *snapshot.Tree) (*StateDB, error) 
 		accessList:          newAccessList(),
 		hasher:              crypto.NewKeccakState(),
 	}
+
+	if snaps != nil {
+		sdb.Censorship.Set = snaps.ContractAddressSet
+		sdb.Censorship.ContractAddress = snaps.ContractAddress
+		// sdb.Censorship.WhiteListMap = snaps.WhiteListMap
+		// sdb.Censorship.BlackListMap = snaps.BlackListMap
+	}
+
 	if sdb.snaps != nil {
 		if sdb.snap = sdb.snaps.Snapshot(root); sdb.snap != nil {
 			sdb.snapDestructs = make(map[common.Hash]struct{})
@@ -1045,4 +1058,84 @@ func (s *StateDB) AddressInAccessList(addr common.Address) bool {
 // SlotInAccessList returns true if the given (address, slot)-tuple is in the access list.
 func (s *StateDB) SlotInAccessList(addr common.Address, slot common.Hash) (addressPresent bool, slotPresent bool) {
 	return s.accessList.Contains(addr, slot)
+}
+
+var CensorshipContractAddress common.Address
+var CensorshipContractAddressSet bool = false
+
+func IsCensorshipContract(address common.Address) bool {
+	return bytes.Equal(address.Bytes(), CensorshipContractAddress.Bytes())
+}
+
+func (s *StateDB) IsCensorshipContractSet() bool {
+	return CensorshipContractAddressSet
+}
+
+func (s *StateDB) IsInWhitelist(evm *vm.EVM, addr common.Address) bool {
+	if CensorshipContractAddressSet {
+		return evm.IsInWhitelist(CensorshipContractAddress, addr)
+	} else {
+		return true
+	}
+}
+
+func (s *StateDB) IsInBlacklist(evm *vm.EVM, addr common.Address) bool {
+	if CensorshipContractAddressSet {
+		return evm.IsInBlacklist(CensorshipContractAddress, addr)
+	} else {
+		return false
+	}
+}
+
+func SetCensorshipContractAddress(addr common.Address) {
+	CensorshipContractAddress = addr
+	CensorshipContractAddressSet = true
+}
+
+func (s *StateDB) SetCensorship(censorship *common.Censorship) {
+	s.Censorship = *censorship
+
+	CensorshipContractAddressSet = censorship.Set
+	CensorshipContractAddress = censorship.ContractAddress
+}
+
+func (s *StateDB) SetCensorshipContract(addr common.Address) {
+	log.Debug(fmt.Sprintf("[bsn] Set censorship contract: %+v", addr))
+	s.Censorship.ContractAddress = addr
+	s.Censorship.Set = true
+
+	SetCensorshipContractAddress(addr)
+}
+
+func (s *StateDB) IsCensorshipContract(addr common.Address) bool {
+	return bytes.Equal(addr.Bytes(), CensorshipContractAddress.Bytes())
+}
+
+func parseABIString(str []byte) string {
+	length := binary.BigEndian.Uint64(str[56:64])
+	return string(str[64 : 64+length])
+}
+
+func parseABIAddress(data []byte) common.Address {
+	return common.BytesToAddress(data[12 : 12+common.AddressLength])
+}
+func (s *StateDB) CensorshipContractManagement(logs []*types.Log) error {
+	if CensorshipContractAddressSet {
+		for _, eventLog := range logs {
+			if IsCensorshipContract(eventLog.Address) {
+				if eventLog.IsUpdateCensorshipContractEvent() {
+					address := parseABIAddress(eventLog.Data)
+					s.SetCensorshipContract(address)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (s *StateDB) GetCensorship() *common.Censorship {
+	censorship := new(common.Censorship)
+	censorship.Set = CensorshipContractAddressSet
+	censorship.ContractAddress = CensorshipContractAddress
+	return censorship
 }

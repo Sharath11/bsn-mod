@@ -100,6 +100,13 @@ func (bc *BlockChain) GetBody(hash common.Hash) *types.Body {
 	return body
 }
 
+// GetCensorship retrieves censorship (set and contract address) from the database
+func (bc *BlockChain) GetCensorship(hash common.Hash) *common.Censorship {
+	number := bc.hc.GetBlockNumber(hash)
+	censorship := rawdb.ReadCensorship(bc.db, hash, *number)
+	return censorship
+}
+
 // GetBodyRLP retrieves a block body in RLP encoding from the database by hash,
 // caching it if found.
 func (bc *BlockChain) GetBodyRLP(hash common.Hash) rlp.RawValue {

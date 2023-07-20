@@ -838,6 +838,8 @@ func (w *worker) commitTransaction(env *environment, tx *types.Transaction) ([]*
 	env.txs = append(env.txs, tx)
 	env.receipts = append(env.receipts, receipt)
 
+    w.chain.SaveCensorship(env.state)
+
 	return receipt.Logs, nil
 }
 

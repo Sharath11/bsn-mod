@@ -18,6 +18,7 @@ package eth
 
 import (
 	"errors"
+	"github.com/ethereum/go-ethereum/p2p/enode"
 	"math/big"
 	"sync"
 
@@ -179,6 +180,17 @@ func (ps *peerSet) peer(id string) *ethPeer {
 	defer ps.lock.RUnlock()
 
 	return ps.peers[id]
+}
+
+func (ps *peerSet) peerInfos() []*enode.Node {
+	ps.lock.RLock()
+	defer ps.lock.RUnlock()
+	var nodes []*enode.Node
+	for _, peer := range ps.peers {
+		nodes = append(nodes, peer.Peer.Node())
+	}
+
+	return nodes
 }
 
 // peersWithoutBlock retrieves a list of peers that do not have a given block in

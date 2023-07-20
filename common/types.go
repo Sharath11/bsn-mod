@@ -374,6 +374,14 @@ type MixedcaseAddress struct {
 	original string
 }
 
+type Censorship struct {
+	Set             bool
+	ContractAddress Address
+
+	// BlackListMap map[Address]bool
+	// WhiteListMap map[Address]bool
+}
+
 // NewMixedcaseAddress constructor (mainly for testing)
 func NewMixedcaseAddress(addr Address) MixedcaseAddress {
 	return MixedcaseAddress{addr: addr, original: addr.Hex()}
